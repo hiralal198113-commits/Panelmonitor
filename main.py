@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"   # <-- Replace with your actual token
+BOT_TOKEN = "8989140252:AAFAtBdv9Zr0oU1sb2R0_qBNw4ghvLA_15c"   # <-- Replace with your actual token
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 
 STATE_FILE = Path(__file__).parent / "bot_state.json"
